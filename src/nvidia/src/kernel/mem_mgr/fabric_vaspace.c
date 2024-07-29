@@ -56,12 +56,33 @@
 
 
 
-//
-// TODO: To be removed when legacy FLA VAS (pKernelBus->flaInfo.pFlaVAS) is removed"
-// The instance block is setup during kbusAllocateFlaVaspace_HAL(). However, we
-// lazily bind it to the new fabric VAS when the very first NV_FABRIC_MEMORY
-// allocations happens.
-//
+
+#include "gpu/mmu/kern_gmmu.h"
+#include "mem_mgr/vaspace.h"
+#include "mem_mgr/fabric_vaspace.h"
+#include "gpu/mem_mgr/mem_mgr.h"
+#include "mem_mgr/gpu_vaspace.h"
+#include "gpu/mem_mgr/virt_mem_allocator_common.h"
+#include "os/os.h"
+#include "gpu/bus/kern_bus.h"
+#include "kernel/gpu/fifo/kernel_fifo.h"
+#include "kernel/gpu/nvlink/kernel_nvlink.h"
+#include "mmu/mmu_walk.h"
+#include "lib/base_utils.h"
+#include "class/cl90f1.h"    // FERMI_VASPACE_A
+#include "class/cl00fc.h"    // FABRIC_VASPACE_A
+#include "class/cl0040.h"    // NV01_MEMORY_LOCAL_USER
+#include "class/cl0080.h"    // NV01_DEVICE_0
+#include "deprecated/rmapi_deprecated.h"
+#include "rmapi/rs_utils.h"
+#include "vgpu/vgpu_events.h"
+#include "mem_mgr/virt_mem_mgr.h"
+#include "compute/fabric.h"
+
+#include "published/ampere/ga100/dev_mmu.h"
+#include "vgpu/rpc.h"
+#include "virtualization/hypervisor/hypervisor.h"
+
 static NV_STATUS
 _fabricvaspaceBindInstBlk
 (
@@ -73,7 +94,6 @@ _fabricvaspaceBindInstBlk
     KernelBus  *pKernelBus  = GPU_GET_KERNEL_BUS(pGpu);
     KernelGmmu *pKernelGmmu = GPU_GET_KERNEL_GMMU(pGpu);
     NV_STATUS   status = NV_OK;
-
     INST_BLK_INIT_PARAMS instblkParams;
 
     if (!pKernelBus->flaInfo.bToggleBindPoint)
@@ -81,34 +101,13 @@ _fabricvaspaceBindInstBlk
         return NV_OK;
     }
 
-    if (gvaspaceIsInUse(dynamicCast(pKernelBus->flaInfo.pFlaVAS, OBJGVASPACE)))
-    {
-        NV_PRINTF(LEVEL_ERROR,
-                  "FabricVAS and FlaVAS cannot be used simultaneously! "
-                  "Instance block setup for fabricVAS failed\n");
-        return NV_ERR_INVALID_OPERATION;
-    }
-
-    //
-    // Check if this is the first fabric vaspace allocation. If this is not the
-    // first allocation, instance block is already setup. Return NV_OK.
-    //
+    // Check if this is the first fabric vaspace allocation
     if (gvaspaceIsInUse(dynamicCast(pFabricVAS->pGVAS, OBJGVASPACE)))
     {
         return NV_OK;
     }
 
-    // Unbind the instance block for FLA vaspace.
-    status = kbusSetupUnbindFla_HAL(pGpu, pKernelBus);
-    if (status != NV_OK)
-    {
-        NV_PRINTF(LEVEL_ERROR,
-                  "Failed to unbind instance block for FlaVAS, status=0x%x\n",
-                  status);
-        return status;
-    }
-
-    // Instantiate the instance block for fabric vaspace.
+    // Instantiate the instance block for fabric vaspace
     portMemSet(&instblkParams, 0, sizeof(instblkParams));
     status = kgmmuInstBlkInit(pKernelGmmu, pKernelBus->flaInfo.pInstblkMemDesc,
                              pFabricVAS->pGVAS, FIFO_PDB_IDX_BASE,
@@ -118,36 +117,23 @@ _fabricvaspaceBindInstBlk
         NV_PRINTF(LEVEL_ERROR,
                   "Failed to setup instance block for fabricVAS, status=0x%x\n",
                   status);
-        goto failed;
+        return status;
     }
 
-    // Bind the instance block for fabric vaspace.
-    status = kbusSetupBindFla_HAL(pGpu, pKernelBus,  pFabricVAS->gfid);
+    // Bind the instance block for fabric vaspace
+    status = kbusSetupBindFla_HAL(pGpu, pKernelBus, pFabricVAS->gfid);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR,
                   "Failed to bind instance block for fabricVAS, status=0x%x\n",
                   status);
-        goto failed;
+        return status;
     }
 
     return NV_OK;
-
-failed:
-    // Instantiate the instance block for FLA vaspace.
-    portMemSet(&instblkParams, 0, sizeof(instblkParams));
-    NV_ASSERT(kgmmuInstBlkInit(pKernelGmmu, pKernelBus->flaInfo.pInstblkMemDesc,
-                              pKernelBus->flaInfo.pFlaVAS, FIFO_PDB_IDX_BASE,
-                              &instblkParams) == NV_OK);
-
-    // Bind the instance block for FLA vaspace.
-    NV_ASSERT(kbusSetupBindFla_HAL(pGpu, pKernelBus,  pFabricVAS->gfid) == NV_OK);
-
-    return status;
 }
 
-//
-// TODO: To be removed when legacy FLA VAS (pKernelBus->flaInfo.pFlaVAS)is removed"
+
 // The instance block is unbind during kbusDestroyFla_HAL(). However, we unbind
 // it here and bind back the instance block for the legacy FLA VAS after the
 // last NV_FABRIC_MEMORY allocation is freed.
@@ -161,39 +147,19 @@ _fabricvaspaceUnbindInstBlk
     OBJVASPACE *pVAS  = staticCast(pFabricVAS, OBJVASPACE);
     OBJGPU     *pGpu  = gpumgrGetGpu(gpumgrGetDefaultPrimaryGpu(pVAS->gpuMask));
     KernelBus  *pKernelBus  = GPU_GET_KERNEL_BUS(pGpu);
-    KernelGmmu *pKernelGmmu = GPU_GET_KERNEL_GMMU(pGpu);
-    INST_BLK_INIT_PARAMS instblkParams = {0};
 
     if (!pKernelBus->flaInfo.bToggleBindPoint)
     {
         return;
     }
 
-    //
-    // Check if there are any pending allocations for the fabric vaspace.
-    // If there are pending allocations, skip restore and return NV_OK.
-    //
     if (gvaspaceIsInUse(dynamicCast(pFabricVAS->pGVAS, OBJGVASPACE)))
     {
         return;
     }
 
-    // Unbind the instance block for fabric vaspace.
+    // Unbind the instance block for fabric vaspace
     NV_ASSERT(kbusSetupUnbindFla_HAL(pGpu, pKernelBus) == NV_OK);
-
-    if (pKernelBus->flaInfo.pFlaVAS != NULL)
-    {
-        // Instantiate the instance block for FLA vaspace.
-        NV_ASSERT(kgmmuInstBlkInit(pKernelGmmu,
-                                   pKernelBus->flaInfo.pInstblkMemDesc,
-                                   pKernelBus->flaInfo.pFlaVAS,
-                                   FIFO_PDB_IDX_BASE,
-                                   &instblkParams) == NV_OK);
-
-        // Bind the instance block for FLA vaspace.
-        NV_ASSERT(kbusSetupBindFla_HAL(pGpu, pKernelBus,
-                                       pFabricVAS->gfid) == NV_OK);
-    }
 }
 
 NV_STATUS
