@@ -38,6 +38,7 @@
 #include <linux/errno.h>
 #include <linux/hugetlb.h>
 #include <linux/pci.h>
+#include <linux/prefetch.h>
 
 #include "nv-p2p.h"
 #include "peer_mem.h"
@@ -288,10 +289,13 @@ static int nv_dma_map(struct sg_table *sg_head, void *context,
 
     nv_mem_context->dma_mapping = dma_mapping;
     nv_mem_context->sg_allocated = 1;
+    prefetch(dma_mapping->dma_addresses);
     for_each_sg(sg_head->sgl, sg, nv_mem_context->npages, i) {
         sg_set_page(sg, NULL, nv_mem_context->page_size, 0);
         sg_dma_address(sg) = dma_mapping->dma_addresses[i];
         sg_dma_len(sg) = nv_mem_context->page_size;
+        prefetch(&dma_mapping->dma_addresses[i+1]);
+
     }
     nv_mem_context->sg_head = *sg_head;
     *nmap = nv_mem_context->npages;
